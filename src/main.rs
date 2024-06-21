@@ -1,146 +1,127 @@
-use std::io::{BufRead, BufReader, Read};
+
+use std::{env, io, thread};
+use std::env::Args;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::{io, thread};
-use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
-
-struct Server
+fn main()
 {
-    tcp_listener: TcpListener,
-    request_handler: Option<Box<dyn Fn(TcpStream)>>,
+    let mode = get_mode_from_args(env::args());
+    match mode {
+        ApplicationType::CLIENT(addr) => connect(&addr),
+        ApplicationType::HOST => listen()
+    }
 }
 
-impl Server {
-    fn new(port: u16) -> io::Result<Self> {
-        let tcp_listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-        Ok(Server{tcp_listener, request_handler: None })
+enum ApplicationType{
+    CLIENT(String), HOST
+}
+
+fn get_mode_from_args(args: Args) -> ApplicationType
+{
+    let args: Vec<String> = args.collect();
+    if let Some(arg) = args.get(1)
+    {
+        return match arg.as_str() {
+            "client" => ApplicationType::CLIENT(args.get(2).unwrap().clone()),
+            "host" => ApplicationType::HOST,
+            _ => ApplicationType::HOST
+        }
+    }
+    ApplicationType::HOST
+}
+
+
+fn listen()
+{
+    let listener = TcpListener::bind("0.0.0.0:3000");
+    match listener {
+        Ok(listener) => {
+            match listener.accept()
+            {
+                Ok((stream, _)) => Client::new(stream).run(),
+                Err(e) => eprintln!("Error when accepting connection: {}", e)
+            }
+
+        }
+        Err(e) => eprintln!("Error when binding: {}", e)
+    }
+}
+
+fn connect(addr: &str)
+{
+    match TcpStream::connect(addr) {
+        Ok(stream) => Client::new(stream).run(),
+        Err(e) => eprintln!("Error when connecting to host: {}", e)
+    }
+}
+
+struct Client
+{
+    stream: TcpStream,
+}
+
+impl Client {
+    fn new(stream: TcpStream) -> Self
+    {
+        Client{stream}
     }
 
-    fn set_handler<F>(&mut self, handler: F) where F: Fn(TcpStream) + 'static {
-        self.request_handler = Some(Box::new(handler));
+    fn run(self)
+    {
+        let mut reader_stream = self.stream.try_clone().unwrap();
+        let mut writer_stream = self.stream.try_clone().unwrap();
+
+        thread::spawn(move || {
+            loop {
+                let mut buffer = [0; 1024];
+                match reader_stream.read(&mut buffer)
+                {
+                    Ok(bytes_read) => {
+                        if bytes_read == 0 {
+                            println!("Connection closed by other client");
+                            break;
+                        }
+                        let received = &buffer[..bytes_read];
+                        println!("Received: {}", String::from_utf8_lossy(received));
+                    }
+                    Err(_) => break
+                }
+            }
+        });
+        thread::spawn(move || {
+            loop {
+                let mut input: String = String::new();
+                let _ = io::stdin().read_line(&mut input);
+                match writer_stream.write_all(input.as_bytes())
+                {
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        loop {
+            if !Client::is_connection_active(&self.stream) {
+                println!("Closing application");
+                std::process::exit(0);
+            }
+        }
     }
 
-    fn run(self) {
-        for stream in self.tcp_listener.incoming() {
-           match stream {
-               Ok(stream) => {
-                   if let Some(ref handler) = self.request_handler {
-                       handler(stream);
-                   } else {
-                       println!("No request handler set");
-                   }
-               }
-               Err(e) => {
-                   eprintln!("Error when receiving request: {}", e);
-               }
-           }
+    fn is_connection_active(stream: &TcpStream) -> bool
+    {
+        let mut buffer = [0; 1];
+        match stream.peek(&mut buffer)
+        {
+            Ok(t) => {
+                if t == 0 {
+                    return false;
+                }
+                true
+            },
+            Err(_) => false
         }
     }
 }
-#[derive(Serialize, Deserialize, Debug)]
-struct MyData {
-    name: String,
-    age: u8,
-}
 
-
-
-fn my_handler(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&mut stream);
-    let buffer : Vec<_> = buf_reader
-        .lines()
-        .map(|result| result.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
-
-    println!("{}", buffer[0]);
-}
-
-fn main() -> io::Result<()> {
-    let mut server = Server::new(4000)?;
-    server.set_handler(my_handler);
-    server.run();
-
-    Ok(())
-}
-
-
-
-
-// fn main() -> std::io::Result<()> {
-//     // Shared buffer with Arc, Mutex, and Condvar
-//     let buffer: Arc<(Mutex<Vec<TcpStream>>, Condvar)> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-//     let producer_ref = Arc::clone(&buffer);
-//     let consumer_ref = Arc::clone(&buffer);
-//
-//     // Spawn a consumer thread to handle requests from the buffer
-//     thread::spawn(move || {
-//         loop {
-//             let (lock, cvar) = &*consumer_ref;
-//             let mut data = lock.lock().unwrap();
-//
-//             // Wait until there's data in the buffer
-//             while data.is_empty() {
-//                 data = cvar.wait(data).unwrap();
-//             }
-//
-//             // Take the first TcpStream from the buffer
-//             let stream = data.remove(0);
-//             drop(data); // Unlock the Mutex early
-//
-//             // Handle the request
-//             if let Err(e) = handle_request(stream) {
-//                 eprintln!("Error handling request: {}", e);
-//             }
-//         }
-//     });
-//
-//     // Main thread that listens for incoming connections
-//     let listener = TcpListener::bind("127.0.0.1:3000")?;
-//     println!("Listening on: 127.0.0.1:3000");
-//
-//     for stream in listener.incoming() {
-//         match stream {
-//             Ok(mut stream) => {
-//                 println!("Putting some stream in the buffer");
-//
-//
-//                 let response = "HTTP/1.1 200 OK\r\n\r\n";
-//                 stream.write_all(response.as_bytes())?;
-//                 stream.flush()?;
-//                 let mut data = producer_ref.0.lock().unwrap();
-//
-//                 data.push(stream);
-//                 producer_ref.1.notify_one(); // Notify the consumer thread
-//             }
-//             Err(e) => {
-//                 eprintln!("Error accepting connection: {}", e);
-//             }
-//         }
-//     }
-//
-//     Ok(())
-//
-//
-// }
-//
-// fn handle_request(mut stream: TcpStream) -> std::io::Result<()> {
-//     println!("Handling request from {:?}", stream.peer_addr()?);
-//
-//     thread::sleep(Duration::new(5, 0));
-//     let buf_reader = BufReader::new(&mut stream);
-//     let _ : Vec<_> = buf_reader
-//         .lines()
-//         .map(|result| result.unwrap())
-//         .take_while(|line| !line.is_empty())
-//         .collect();
-//
-//     // Craft a simple HTTP response
-//     // let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\nHello World!";
-//     let response = "HTTP/1.1 200 OK\r\n\r\n";
-//     stream.write_all(response.as_bytes())?;
-//     stream.flush()?;
-//
-//     Ok(())
-// }
